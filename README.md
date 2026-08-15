@@ -1,98 +1,90 @@
 # LinkPlease Instagram DM Automation Engine
 
-A high-performance, ultra-resilient microservice built with **Python**, **FastAPI**, and **PostgreSQL / SQLite** designed to automate Instagram DMs while gracefully handling hostile API conditions (rate limits, transient 500s, out-of-order events, duplicate webhooks, HMAC signature security, and asynchronous DM delivery failures).
+A high-performance, resilient microservice built with **Python**, **FastAPI**, and **PostgreSQL** (with **SQLite WAL** fallback) designed to automate Instagram DMs under hostile API conditions—handling rate limits, transient 500 errors, out-of-order events, duplicate webhooks, HMAC signature security, and asynchronous DM delivery reconciliation.
 
 ---
 
 ## 🌐 Live Production Deployment
 
 - 📊 **Live Stats**: https://linkplease-dm-automation-ol6m.onrender.com/stats
-- 🛠️ **Interactive Swagger Docs**: https://linkplease-dm-automation-ol6m.onrender.com/docs
+- 🛠️ **Interactive Swagger API Docs**: https://linkplease-dm-automation-ol6m.onrender.com/docs
 - ❤️ **Health Check**: https://linkplease-dm-automation-ol6m.onrender.com/health
 - 📖 **ReDoc Documentation**: https://linkplease-dm-automation-ol6m.onrender.com/redoc
-- 🐙 **GitHub Repository**: https://github.com/vattikuntadinesh/linkplease-dm-automation
+- 🐙 **GitHub Repository**: https://github.com/dineshvattikunta/linkplease-dm-automation
 
 ---
 
-## 🚀 Key Architectural Features & Scope Coverage
+## ✨ System Features & Capabilities
 
-- **Part A (Core Automation)**:
-  - Dynamic rule creation (`POST /rules`) with case-insensitive keyword matching.
-  - Atomic database-level user-rule deduplication (`user_id`, `rule_id` UNIQUE constraint).
-  - Exponential backoff retry loop (`2^attempts` seconds) for transient 500 API errors.
-- **Part B (Security & Live Metrics)**:
-  - HMAC SHA-256 webhook signature verification (`X-PseudoGram-Signature`) computed over raw request body bytes. Rejects forged requests with `401 Unauthorized`.
-  - Atomic `/stats` tracking endpoint (`sent`, `failed`, `queued`, `duplicates_blocked`).
-  - `POST /reset` endpoint to reset database stats clean for fresh benchmarks.
-- **Part C (Hostile Environment Resilience)**:
-  - Background delivery reconciliation loop (`GET /v1/dm/{dm_id}`). Only marks DMs as `sent` when confirmed `DELIVERED` by remote API.
-  - Intelligent `comment.deleted` handling (cancels queued tasks if comment is deleted before dispatch).
-  - Sliding-window rate limiter enforcing a strict maximum of 9 requests per 60 seconds.
-  - Dual database support: Render Free **PostgreSQL** (`asyncpg`) for production persistence, and **SQLite (WAL mode)** for local development.
+- **Core DM Automation**: Dynamic rule creation (`POST /rules`) supporting case-insensitive keyword matching and custom DM messaging.
+- **HMAC SHA-256 Security**: Webhook signature verification (`X-PseudoGram-Signature`) computed directly over raw request bytes before JSON parsing. Rejects unauthorized or forged webhooks with `401 Unauthorized`.
+- **Atomic Database Deduplication**: Enforces a DB-level UNIQUE constraint on `(user_id, rule_id)` to ensure duplicate user comments are blocked atomically with zero race conditions.
+- **Sliding-Window Rate Limiter**: Enforces a strict cap of 9 requests per rolling 60-second window to prevent 429 rate limit breaches against the remote API.
+- **Exponential Backoff Worker**: Background task processor that automatically retries transient `500 Internal Error` responses with exponential backoff (`2^attempts` seconds) up to a max retry limit.
+- **Confirmed Delivery Reconciliation**: Polling worker (`GET /v1/dm/{dm_id}`) that updates DM state to `sent` **only** after remote delivery is confirmed as `DELIVERED`.
+- **Intelligent Comment Deletion**: Listens for `comment.deleted` events and automatically cancels queued DM tasks before dispatch.
+- **Dual Database Architecture**: Connects to Render Free **PostgreSQL** (`asyncpg`) in production for permanent persistence across restarts, and uses **SQLite (WAL mode)** for local development.
 
 ---
 
-## 📽️ Loom Video Recording Guide & Presentation Talk Track
+## 📋 API Contract Reference
 
-When recording your **3-minute Loom video**, follow this exact structure and transcript guide:
+### `POST /rules`
+Creates a keyword automation rule.
+- **Request Body**: `{"keyword": "PRICE", "dm_message": "Here is the price list: $99!"}`
+- **Response (201 Created)**: `{"rule_id": "rule_12345", "keyword": "PRICE", "dm_message": "Here is the price list: $99!"}`
 
-### Video Agenda (3 Minutes Total)
+### `POST /webhook`
+Receives Instagram comment events and enqueues DM dispatches.
+- **Headers**: `X-PseudoGram-Signature: sha256=<hex_digest>`
+- **Response (200 OK)**: `{"status": "ok"}`
 
-#### 0:00 - 0:45 | Introduction & Live Swagger Demo
-- **Show Screen**: Open https://linkplease-dm-automation-ol6m.onrender.com/docs in your browser.
-- **What to say**:
-  > *"Hi, I'm Dinesh Vattikunta. This is the LinkPlease Instagram DM Automation Engine. Here is our live deployed application running on Render backed by PostgreSQL. As you can see, our `/health`, `/rules`, `/webhook`, `/stats`, and `/reset` endpoints match the assignment contract 100%."*
+### `GET /stats`
+Retrieves live real-time system metrics.
+- **Response (200 OK)**: `{"sent": 70, "failed": 5, "queued": 0, "duplicates_blocked": 1023}`
 
-#### 0:45 - 1:45 | Architecture & Key Technical Highlights
-- **Show Screen**: Open `app/routes/webhook.py` or `FAILURES.md` on your screen.
-- **What to say**:
-  > *"Our system handles hostile API conditions in 4 key ways:*
-  > 1. **HMAC SHA-256 Security**: We verify signatures over raw request body bytes before JSON parsing to reject forged webhooks.
-  > 2. **Atomic DB Deduplication**: We use a database UNIQUE constraint on `(user_id, rule_id)` so concurrent duplicate comments get blocked instantly with zero race conditions.
-  > 3. **Sliding Window Rate Limiter**: We cap requests at 9 per 60 seconds to guarantee we never hit 429 rate limit errors.
-  > 4. **Confirmed Delivery Reconciliation**: DMs are only counted as `sent` after our background reconciler polls `GET /v1/dm/{dm_id}` and receives a `DELIVERED` status."*
+### `GET /health`
+Returns service health status and configuration check.
+- **Response (200 OK)**: `{"status": "healthy", "service": "LinkPlease Instagram DM Automation", "api_key_configured": true}`
 
-#### 1:45 - 2:30 | Required Question 1: Tradeoff Made & What Was Given Up
-- **What to say**:
-  > *"For Question 1: What tradeoff did we make?  
-  > We traded raw in-memory speed for 100% durable PostgreSQL disk persistence and a conservative 9 req/60s rate limit. By writing every webhook task to disk before returning HTTP 200, we gave up peak instantaneous throughput (~10% slower burst processing), but we gained zero data loss on process restarts and zero rate-limit breaches."*
-
-#### 2:30 - 3:00 | Required Question 2: What You'd Do Differently With One More Week
-- **What to say**:
-  > *"For Question 2: What would we do differently with one more week?  
-  > I would replace the single background worker loop with a distributed worker architecture using Redis Streams and Celery/APScheduler. This would allow multi-tenant rate limiting across thousands of Instagram creator accounts simultaneously, accompanied by a WebSockets live dashboard."*
+### `POST /reset`
+Resets stats and clears DM records for clean benchmarking.
+- **Response (200 OK)**: `{"status": "ok", "message": "Database and stats reset clean"}`
 
 ---
 
-## 🛠️ Local Quickstart Guide
+## 🛠️ Local Development Quickstart
 
 ### 1. Install Dependencies
 ```powershell
 pip install -r requirements.txt
 ```
 
-### 2. Run the Automated Unit Test Suite
+### 2. Run Automated Test Suite
 ```powershell
 python -m pytest
 ```
 
-### 3. Start the Web Server Locally
+### 3. Start Local Development Server
 ```powershell
 python -m uvicorn app.main:app --reload --port 8000
 ```
-Interactive docs will be available at `http://localhost:8000/docs`.
+Swagger UI will be accessible at `http://localhost:8000/docs`.
 
-### 4. Run 500-Event Simulation Test Against Live Server
+### 4. Run Production Simulation Stress Test
 ```powershell
 python scripts/run_simulation.py https://linkplease-dm-automation-ol6m.onrender.com/webhook
 ```
 
 ---
 
-## 📝 Final Submission
+## ⚙️ Environment Variables Reference
 
-To submit your assignment:
-
-```powershell
-python scripts/submit_assignment.py
-```
+| Variable | Description | Default |
+|---|---|---|
+| `API_KEY` | Pseudogram API Secret Key | *(Set in .env)* |
+| `PSEUDOGRAM_BASE_URL` | Pseudogram API Endpoint | `https://pseudogram-api.onrender.com` |
+| `DATABASE_URL` | PostgreSQL or SQLite Connection URL | `sqlite+aiosqlite:///./linkplease.db` |
+| `RATE_LIMIT_MAX_REQUESTS` | Max API calls per window | `9` |
+| `RATE_LIMIT_WINDOW_SECONDS` | Rate limit window in seconds | `60` |
+| `MAX_RETRY_ATTEMPTS` | Max retry attempts on 500 errors | `5` |

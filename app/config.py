@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     USER_PHONE: str = "+91 7989853264"
     USER_WHATSAPP: str = "+91 7989853264"
     USER_LINKEDIN: str = "https://www.linkedin.com/in/dinesh-vattikunta"
-    GITHUB_REPO_URL: str = "https://github.com/vattikuntadinesh/linkplease-dm-automation"
+    GITHUB_REPO_URL: str = "https://github.com/dineshvattikunta/linkplease-dm-automation"
     WORKING_URL: str = "https://linkplease-dm-automation.onrender.com"
     LOOM_URL: str = "https://loom.com/share/placeholder"
 
