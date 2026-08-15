@@ -137,17 +137,25 @@ class DMWorker:
                 logger.error(f"Task {task.id} non-retryable failure {status_code}: {response.text}")
 
         except Exception as e:
-            task.attempts += 1
-            task.last_error = str(e)
-            task.updated_at = datetime.datetime.utcnow()
-            if task.attempts >= settings.MAX_RETRY_ATTEMPTS:
-                task.status = "failed"
-                await self._increment_stat(db, failed=1)
-            else:
-                backoff = 2 ** task.attempts
-                task.next_run_at = datetime.datetime.utcnow() + datetime.timedelta(seconds=backoff)
-            await db.commit()
+            await db.rollback()
             logger.error(f"Network exception on task {task.id}: {e}")
+            try:
+                async with AsyncSessionLocal() as fresh_db:
+                    t = await fresh_db.get(DMTask, task.id)
+                    if t and t.status == "queued":
+                        t.attempts += 1
+                        t.last_error = str(e)[:250]
+                        t.updated_at = datetime.datetime.utcnow()
+                        if t.attempts >= settings.MAX_RETRY_ATTEMPTS:
+                            t.status = "failed"
+                            await self._increment_stat(fresh_db, failed=1)
+                        else:
+                            backoff = 2 ** t.attempts
+                            t.next_run_at = datetime.datetime.utcnow() + datetime.timedelta(seconds=backoff)
+                        await fresh_db.commit()
+            except Exception as inner_e:
+                logger.error(f"Error handling task exception recovery: {inner_e}")
+
 
     async def _increment_stat(self, db, sent: int = 0, failed: int = 0, queued: int = 0, duplicates_blocked: int = 0):
         await db.execute(
