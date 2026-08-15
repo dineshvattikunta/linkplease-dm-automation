@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: linkplease-dm-automation
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: API_KEY
+        value: YOUR_API_KEY_HERE
+      - key: PSEUDOGRAM_BASE_URL
+        value: https://pseudogram-api.onrender.com
+      - key: USER_NAME
+        value: Vattikunta Dinesh Chowdary
+      - key: USER_EMAIL
+        value: vattikuntad@gmail.com
+      - key: RATE_LIMIT_MAX_REQUESTS
+        value: "9"
+      - key: RATE_LIMIT_WINDOW_SECONDS
+        value: "60"
