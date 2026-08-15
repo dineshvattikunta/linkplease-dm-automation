@@ -1,8 +1,8 @@
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, update, delete
 from app.database import get_db
-from app.models import StatCounter, DMTask
+from app.models import StatCounter, DMTask, WebhookEvent, UserRuleDispatch
 from app.schemas import StatsResponse
 
 router = APIRouter(tags=["Stats"])
@@ -27,3 +27,21 @@ async def get_stats(db: AsyncSession = Depends(get_db)):
         queued=queued,
         duplicates_blocked=duplicates_blocked
     )
+
+@router.post("/reset", status_code=status.HTTP_200_OK)
+async def reset_database(db: AsyncSession = Depends(get_db)):
+    """
+    Clears all DM records, webhook events, user rule dispatches, 
+    and resets stat counters to 0.
+    """
+    await db.execute(delete(DMTask))
+    await db.execute(delete(WebhookEvent))
+    await db.execute(delete(UserRuleDispatch))
+    await db.execute(
+        update(StatCounter).where(StatCounter.id == 1).values(
+            sent=0, failed=0, queued=0, duplicates_blocked=0
+        )
+    )
+    await db.commit()
+    return {"status": "ok", "message": "Database and stats reset clean"}
+
