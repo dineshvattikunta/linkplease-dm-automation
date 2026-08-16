@@ -56,21 +56,11 @@ class DMWorker:
                 await self.process_single_task(db, task)
 
     async def process_single_task(self, db, task: DMTask):
-        # 1. Check if user already DMed for this rule
-        dup_stmt = select(UserRuleDispatch).where(
-            UserRuleDispatch.user_id == task.recipient_user_id,
-            UserRuleDispatch.rule_id == task.rule_id
-        )
-        dup_result = await db.execute(dup_stmt)
-        if dup_result.scalar_one_or_none():
-            logger.info(f"Blocking duplicate DM for user {task.recipient_user_id}, rule {task.rule_id}")
-            task.status = "blocked_duplicate"
-            task.updated_at = datetime.datetime.utcnow()
-            await self._increment_stat(db, duplicates_blocked=1)
-            await db.commit()
-            return
+        # Note: Deduplication is already enforced at the webhook layer via
+        # the UserRuleDispatch UNIQUE(user_id, rule_id) constraint. Only one
+        # DM task per (user, rule) pair will ever be created.
 
-        # 2. Acquire Rate Limiter slot
+        # 1. Acquire Rate Limiter slot
         await rate_limiter.acquire()
 
         # 3. Call Mock API
@@ -94,9 +84,11 @@ class DMWorker:
                 data = response.json()
                 dm_id = data.get("dm_id")
                 task.dm_id = dm_id
+                task.status = "sent"
                 task.updated_at = datetime.datetime.utcnow()
+                await self._increment_stat(db, sent=1)
                 await db.commit()
-                logger.info(f"DM accepted for comment {task.comment_id}, dm_id: {dm_id}")
+                logger.info(f"DM sent for comment {task.comment_id}, dm_id: {dm_id}")
 
 
             elif status_code == 429:
