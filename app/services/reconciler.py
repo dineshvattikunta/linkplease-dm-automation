@@ -31,6 +31,29 @@ class ReconcilerService:
 
     async def reconcile_pending_dms(self):
         async with AsyncSessionLocal() as db:
+            # ── 1. Recover tasks stuck in "processing" for > 30 s ────────────
+            # This handles the case where a concurrent worker crashed between
+            # claiming a task and completing it.
+            cutoff = datetime.datetime.utcnow() - datetime.timedelta(seconds=30)
+            stuck_stmt = (
+                select(DMTask)
+                .where(
+                    DMTask.status == "processing",
+                    DMTask.updated_at <= cutoff,
+                )
+                .limit(20)
+            )
+            stuck_result = await db.execute(stuck_stmt)
+            stuck_tasks = stuck_result.scalars().all()
+            for task in stuck_tasks:
+                task.status = "queued"
+                task.next_run_at = datetime.datetime.utcnow()
+                task.updated_at = datetime.datetime.utcnow()
+                logger.warning(f"Reconciler: reset stuck-processing task {task.id} back to queued")
+            if stuck_tasks:
+                await db.commit()
+
+            # ── 2. Check tasks with a dm_id that haven't confirmed sent yet ──
             stmt = (
                 select(DMTask)
                 .where(

@@ -16,8 +16,10 @@ async def get_stats(db: AsyncSession = Depends(get_db)):
     failed = stat.failed if stat else 0
     duplicates_blocked = stat.duplicates_blocked if stat else 0
 
-    # Calculate live queued count directly from DMTask table
-    queued_stmt = select(func.count(DMTask.id)).where(DMTask.status == "queued")
+    # Calculate live queued count (includes "processing" tasks in-flight)
+    queued_stmt = select(func.count(DMTask.id)).where(
+        DMTask.status.in_(["queued", "processing"])
+    )
     queued_result = await db.execute(queued_stmt)
     queued = queued_result.scalar() or 0
 
