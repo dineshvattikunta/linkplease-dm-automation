@@ -1,9 +1,8 @@
 import json
 import logging
-from fastapi import APIRouter, Request, Header, HTTPException, status, Depends
+from fastapi import APIRouter, Request, Header, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
-from sqlalchemy.exc import IntegrityError
 from app.database import get_db
 from app.security import verify_webhook_signature
 from app.models import WebhookEvent, Rule, DMTask, UserRuleDispatch, StatCounter
@@ -116,24 +115,32 @@ async def handle_webhook(
                     all_rules = rules_result.scalars().all()
 
                     for rule in all_rules:
-                        if rule.keyword in text_lower:
-                            try:
-                                async with db.begin_nested():
-                                    dispatch_entry = UserRuleDispatch(
-                                        user_id=user_id,
-                                        rule_id=rule.rule_id,
-                                        comment_id=comment_id
-                                    )
-                                    db.add(dispatch_entry)
-                            except IntegrityError:
+                        if rule.keyword.lower() in text_lower:
+                            # Explicit SELECT-before-INSERT dedup (reliable across all async drivers)
+                            existing_dispatch = await db.execute(
+                                select(UserRuleDispatch).where(
+                                    UserRuleDispatch.user_id == user_id,
+                                    UserRuleDispatch.rule_id == rule.rule_id
+                                ).limit(1)
+                            )
+                            if existing_dispatch.scalar_one_or_none() is not None:
                                 await db.execute(
                                     update(StatCounter).where(StatCounter.id == 1).values(
                                         duplicates_blocked=StatCounter.duplicates_blocked + 1
                                     )
                                 )
-                                logger.info(f"User {user_id} already DMed for rule {rule.rule_id}. Skipping.")
+                                logger.info(f"User {user_id} already dispatched for rule {rule.rule_id}. Skipping.")
                                 continue
 
+                            # Reserve dispatch slot
+                            dispatch_entry = UserRuleDispatch(
+                                user_id=user_id,
+                                rule_id=rule.rule_id,
+                                comment_id=comment_id
+                            )
+                            db.add(dispatch_entry)
+
+                            # Enqueue DM task
                             task = DMTask(
                                 comment_id=comment_id,
                                 recipient_user_id=user_id,
@@ -146,14 +153,9 @@ async def handle_webhook(
 
                 await db.commit()
 
-        except IntegrityError as ie:
+        except Exception as ie:
             await db.rollback()
-            await db.execute(
-                update(StatCounter).where(StatCounter.id == 1).values(
-                    duplicates_blocked=StatCounter.duplicates_blocked + 1
-                )
-            )
-            await db.commit()
-            logger.info(f"IntegrityError on event_id {event_id}. Incremented duplicates_blocked.")
+            logger.error(f"Unexpected error processing event_id {event_id}: {ie}", exc_info=True)
+
 
     return {"status": "ok"}
