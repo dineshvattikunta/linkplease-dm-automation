@@ -3,7 +3,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     # Mock API credentials
-    API_KEY: str = ""
+    API_KEY: str = "YOUR_API_KEY_HERE"
     PSEUDOGRAM_BASE_URL: str = "https://pseudogram-api.onrender.com"
 
     # Profile & Submission info
