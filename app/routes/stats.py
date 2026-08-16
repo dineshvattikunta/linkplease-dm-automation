@@ -31,12 +31,14 @@ async def get_stats(db: AsyncSession = Depends(get_db)):
 @router.post("/reset", status_code=status.HTTP_200_OK)
 async def reset_database(db: AsyncSession = Depends(get_db)):
     """
-    Clears all DM records, webhook events, user rule dispatches, 
-    and resets stat counters to 0.
+    Clears ALL records (rules, DM tasks, webhook events, dispatches)
+    and resets stat counters to 0. Use before each test run.
     """
+    from app.models import Rule
     await db.execute(delete(DMTask))
-    await db.execute(delete(WebhookEvent))
     await db.execute(delete(UserRuleDispatch))
+    await db.execute(delete(WebhookEvent))
+    await db.execute(delete(Rule))
     await db.execute(
         update(StatCounter).where(StatCounter.id == 1).values(
             sent=0, failed=0, queued=0, duplicates_blocked=0
