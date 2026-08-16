@@ -31,10 +31,11 @@ class ReconcilerService:
 
     async def reconcile_pending_dms(self):
         async with AsyncSessionLocal() as db:
-            # ── 1. Recover tasks stuck in "processing" for > 30 s ────────────
-            # This handles the case where a concurrent worker crashed between
-            # claiming a task and completing it.
-            cutoff = datetime.datetime.utcnow() - datetime.timedelta(seconds=30)
+            # ── 1. Recover tasks stuck in "processing" for > 60 s ────────────
+            # Threshold is 60 s (not 30) so Render free-tier HTTP calls that
+            # take 20-40 s don't get prematurely reset while the worker is
+            # still waiting for a response.
+            cutoff = datetime.datetime.utcnow() - datetime.timedelta(seconds=60)
             stuck_stmt = (
                 select(DMTask)
                 .where(

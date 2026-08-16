@@ -172,7 +172,11 @@ class DMWorker:
     async def _mark_sent(self, task_id: int, dm_id: Optional[str]):
         async with AsyncSessionLocal() as db:
             t = await db.get(DMTask, task_id)
-            if t:
+            # Only proceed if this worker is still the rightful owner.
+            # If the reconciler reset the task to "queued" and another worker
+            # re-claimed it, t.status will no longer be "processing" here —
+            # we skip the counter increment to prevent double-counting.
+            if t and t.status == "processing":
                 t.status = "sent"
                 t.dm_id = dm_id
                 t.updated_at = datetime.datetime.utcnow()
@@ -182,6 +186,11 @@ class DMWorker:
                     )
                 )
                 await db.commit()
+            elif t:
+                logger.warning(
+                    f"_mark_sent: task {task_id} status={t.status!r} — "
+                    "skipping counter increment (likely reconciler reset)"
+                )
 
     async def _mark_requeue(self, task_id: int, delay_s: float, error: str):
         async with AsyncSessionLocal() as db:

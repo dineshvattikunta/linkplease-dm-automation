@@ -3,9 +3,17 @@ import logging
 from fastapi import APIRouter, Request, Header, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
+from app.config import settings
 from app.database import get_db
 from app.security import verify_webhook_signature
 from app.models import WebhookEvent, Rule, DMTask, UserRuleDispatch, StatCounter
+
+# Dialect-aware atomic insert (eliminates TOCTOU race under concurrent requests)
+_IS_POSTGRES = "postgresql" in settings.DATABASE_URL.lower()
+if _IS_POSTGRES:
+    from sqlalchemy.dialects.postgresql import insert as _upsert_insert
+else:
+    from sqlalchemy.dialects.sqlite import insert as _upsert_insert
 
 logger = logging.getLogger("webhook")
 router = APIRouter(tags=["Webhook"])
@@ -116,40 +124,43 @@ async def handle_webhook(
 
                     for rule in all_rules:
                         if rule.keyword.lower() in text_lower:
-                            # Explicit SELECT-before-INSERT dedup (reliable across all async drivers)
-                            existing_dispatch = await db.execute(
-                                select(UserRuleDispatch).where(
-                                    UserRuleDispatch.user_id == user_id,
-                                    UserRuleDispatch.rule_id == rule.rule_id
-                                ).limit(1)
-                            )
-                            if existing_dispatch.scalar_one_or_none() is not None:
-                                await db.execute(
-                                    update(StatCounter).where(StatCounter.id == 1).values(
-                                        duplicates_blocked=StatCounter.duplicates_blocked + 1
-                                    )
+                            # ── Atomic dedup: INSERT ... ON CONFLICT DO NOTHING ──────────
+                            # Uses a DB-level constraint (uq_user_rule) to atomically
+                            # block duplicate (user_id, rule_id) pairs even under
+                            # concurrent requests — no TOCTOU race possible.
+                            dispatch_stmt = (
+                                _upsert_insert(UserRuleDispatch)
+                                .values(
+                                    user_id=user_id,
+                                    rule_id=rule.rule_id,
+                                    comment_id=comment_id,
                                 )
-                                logger.info(f"User {user_id} already dispatched for rule {rule.rule_id}. Skipping.")
+                                .on_conflict_do_nothing(
+                                    index_elements=["user_id", "rule_id"]
+                                )
+                            )
+                            dispatch_result = await db.execute(dispatch_stmt)
+
+                            if dispatch_result.rowcount == 0:
+                                # Conflict: this user was already dispatched for this rule
+                                await db.execute(
+                                    update(StatCounter)
+                                    .where(StatCounter.id == 1)
+                                    .values(duplicates_blocked=StatCounter.duplicates_blocked + 1)
+                                )
+                                logger.info(f"Duplicate dispatch blocked: user={user_id} rule={rule.rule_id}")
                                 continue
 
-                            # Reserve dispatch slot
-                            dispatch_entry = UserRuleDispatch(
-                                user_id=user_id,
-                                rule_id=rule.rule_id,
-                                comment_id=comment_id
-                            )
-                            db.add(dispatch_entry)
-
-                            # Enqueue DM task
+                            # Slot successfully reserved — enqueue DM task
                             task = DMTask(
                                 comment_id=comment_id,
                                 recipient_user_id=user_id,
                                 rule_id=rule.rule_id,
                                 message=rule.dm_message,
-                                status="queued"
+                                status="queued",
                             )
                             db.add(task)
-                            logger.info(f"Enqueued DM task for user {user_id}, comment {comment_id}, rule {rule.rule_id}")
+                            logger.info(f"Enqueued DM task: user={user_id} comment={comment_id} rule={rule.rule_id}")
 
                 await db.commit()
 
