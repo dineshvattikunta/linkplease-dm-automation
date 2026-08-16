@@ -12,7 +12,9 @@ logger = logging.getLogger("webhook")
 router = APIRouter(tags=["Webhook"])
 
 @router.post("/webhook", status_code=status.HTTP_200_OK)
+@router.post("/webhook/", status_code=status.HTTP_200_OK)
 async def handle_webhook(
+
     request: Request,
     x_pseudogram_signature: str = Header(None, alias="X-PseudoGram-Signature"),
     db: AsyncSession = Depends(get_db)
