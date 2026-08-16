@@ -12,28 +12,28 @@ from app.services.rate_limiter import rate_limiter
 logger = logging.getLogger("dm_worker")
 logging.basicConfig(level=logging.INFO)
 
-# ─── Concurrency-safety proof ─────────────────────────────────────────────────
+# ─── Concurrency-safety notes ─────────────────────────────────────────────────
 #
-# CLAIM RACE: Multiple workers could SELECT the same "queued" task simultaneously.
-# Fix: _task_claim_lock (asyncio.Lock) serialises the SELECT + UPDATE "processing"
-# pair. Lock is released *before* the HTTP call, so workers run API calls in
-# parallel while claiming stays serial. Lock hold time: ~5–20 ms (one DB round
-# trip). Zero risk of deadlock because the lock is never held across an await
-# that could itself block on the lock.
+# CLAIM RACE  : _task_claim_lock (asyncio.Lock) serialises SELECT + UPDATE
+#               "processing".  Lock is held for one DB round-trip (~10-20 ms).
+#               HTTP calls happen outside the lock → true parallelism.
 #
-# STATS RACE: Multiple workers complete near-simultaneously and call
-# UPDATE stat_counters SET sent = sent + 1. This is a PostgreSQL atomic
-# row-level UPDATE — the DB engine serialises concurrent writers on the row;
-# no lost-update is possible.
+# DB POOL     : Each of the three DB phases (claim / write-result / stat-inc)
+#               uses its own short-lived AsyncSessionLocal context.  The HTTP
+#               call happens between phases with NO connection held.  8 workers
+#               never need more than 8 simultaneous connections even in the
+#               worst case, and in practice each hold is < 50 ms.
 #
-# RATE LIMIT RACE: Token bucket uses its own asyncio.Lock (_lock). Each
-# acquire() atomically reads + advances _next_allowed before releasing. Workers
-# that call acquire() concurrently get staggered tokens (T=0, T+6.67s, T+13.33s
-# …), guaranteeing exactly 9 API calls per 60 s across all workers combined —
-# the hard Pseudogram ceiling is never breached regardless of worker count.
+# STATS RACE  : UPDATE stat_counters SET sent = sent + 1 is an atomic
+#               row-level SQL UPDATE.  PostgreSQL serialises concurrent writers
+#               at the storage engine level — no lost-update possible.
 #
-# STUCK-PROCESSING RECOVERY: If a worker crashes between "processing" and "sent",
-# the reconciler resets tasks stuck in "processing" for > 30 s back to "queued".
+# RATE LIMIT  : All workers share the same TokenBucketRateLimiter singleton.
+#               Its asyncio.Lock serialises acquire() so each worker gets a
+#               staggered token (T, T+6.67s, T+13.33s …). Total API call rate
+#               across all workers is capped at exactly 9 / 60 s.
+#
+# CRASH SAFETY: Reconciler resets tasks stuck in "processing" for > 30 s.
 # ─────────────────────────────────────────────────────────────────────────────
 
 NUM_WORKERS = 8
@@ -54,7 +54,6 @@ class DMWorker:
             asyncio.create_task(self._worker_loop(i))
             for i in range(NUM_WORKERS)
         ]
-        # Block until all workers exit (or are cancelled at shutdown)
         await asyncio.gather(*self._worker_tasks, return_exceptions=True)
 
     async def stop(self):
@@ -70,26 +69,23 @@ class DMWorker:
     async def _worker_loop(self, worker_id: int):
         while self.is_running:
             try:
-                task_id = await self._claim_one_task()
-                if task_id is not None:
-                    await self._process_task(task_id)
+                task_snapshot = await self._claim_one_task()
+                if task_snapshot is not None:
+                    await self._process_task(task_snapshot)
                 else:
-                    # No tasks ready — back off briefly before polling again
                     await asyncio.sleep(0.5)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Worker {worker_id} unhandled error: {e}", exc_info=True)
+                logger.error(f"Worker {worker_id} error: {e}", exc_info=True)
                 await asyncio.sleep(1.0)
 
-    # ── Atomic task claim ─────────────────────────────────────────────────────
+    # ── Phase 1: Atomic claim  (DB connection held < 50 ms) ──────────────────
 
-    async def _claim_one_task(self) -> Optional[int]:
+    async def _claim_one_task(self) -> Optional[dict]:
         """
-        Atomically select the oldest queued task and mark it 'processing'.
-        _task_claim_lock ensures only one coroutine executes the
-        SELECT + UPDATE pair at a time, preventing duplicate claims.
-        Lock is released before the HTTP call so workers remain concurrent.
+        Atomically claims one queued task.  Returns a plain dict snapshot of
+        the task data so the connection can be released before the HTTP call.
         """
         async with _task_claim_lock:
             async with AsyncSessionLocal() as db:
@@ -111,112 +107,126 @@ class DMWorker:
                 task.status = "processing"
                 task.updated_at = now
                 await db.commit()
-                return task.id
+                # Return a plain snapshot — no live ORM object crosses the session boundary
+                return {
+                    "id": task.id,
+                    "recipient_user_id": task.recipient_user_id,
+                    "message": task.message,
+                    "comment_id": task.comment_id,
+                    "rule_id": task.rule_id,
+                    "attempts": task.attempts,
+                }
 
-    # ── Task processing (runs concurrently across workers) ────────────────────
+    # ── Phase 2 + 3: Send DM, then write result  (no DB held during HTTP) ────
 
-    async def _process_task(self, task_id: int):
-        # Block here until the shared token bucket grants a slot.
-        # All 8 workers share the same rate_limiter instance, so the total
-        # API call rate across all workers is capped at 9 / 60 s.
+    async def _process_task(self, snap: dict):
+        task_id = snap["id"]
+
+        # Block until rate-limit slot granted (shared across all workers).
         await rate_limiter.acquire()
 
+        url = f"{settings.PSEUDOGRAM_BASE_URL}/v1/dm/send"
+        headers = {
+            "X-API-Key": settings.API_KEY,
+            "Idempotency-Key": f"dm_req_{snap['comment_id']}_{snap['rule_id']}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "recipient_user_id": snap["recipient_user_id"],
+            "message": snap["message"],
+            "comment_id": snap["comment_id"],
+        }
+
+        # ── HTTP call — NO database connection is held here ──────────────────
+        try:
+            response = await self.http_client.post(url, json=payload, headers=headers)
+            sc = response.status_code
+        except Exception as exc:
+            logger.error(f"Network error task {task_id}: {exc}")
+            await self._mark_retry_or_fail(task_id, snap["attempts"], str(exc)[:250])
+            return
+
+        # ── Phase 3: Write result (new short-lived DB session) ────────────────
+        if sc in (200, 202):
+            dm_id = response.json().get("dm_id")
+            await self._mark_sent(task_id, dm_id)
+            logger.info(f"Task {task_id} sent → dm_id={dm_id}")
+
+        elif sc == 429:
+            retry_after = float(response.headers.get("Retry-After", "10"))
+            await rate_limiter.update_backoff(retry_after)
+            await self._mark_requeue(task_id, retry_after, f"429 Retry-After={retry_after}s")
+            logger.warning(f"Task {task_id} rate-limited, retry in {retry_after}s")
+
+        elif sc >= 500:
+            backoff = 2 ** (snap["attempts"] + 1)
+            await self._mark_retry_or_fail(task_id, snap["attempts"], f"HTTP {sc}")
+            logger.warning(f"Task {task_id} server error {sc}")
+
+        else:
+            await self._mark_failed(task_id, f"HTTP {sc}: {response.text[:200]}")
+            logger.error(f"Task {task_id} non-retryable {sc}")
+
+    # ── Result writers (each uses its own short-lived session) ───────────────
+
+    async def _mark_sent(self, task_id: int, dm_id: Optional[str]):
         async with AsyncSessionLocal() as db:
-            task = await db.get(DMTask, task_id)
-            if task is None or task.status != "processing":
-                # Already handled (e.g. by reconciler reset) — skip silently
-                return
+            t = await db.get(DMTask, task_id)
+            if t:
+                t.status = "sent"
+                t.dm_id = dm_id
+                t.updated_at = datetime.datetime.utcnow()
+                await db.execute(
+                    update(StatCounter).where(StatCounter.id == 1).values(
+                        sent=StatCounter.sent + 1
+                    )
+                )
+                await db.commit()
 
-            url = f"{settings.PSEUDOGRAM_BASE_URL}/v1/dm/send"
-            headers = {
-                "X-API-Key": settings.API_KEY,
-                "Idempotency-Key": f"dm_req_{task.comment_id}_{task.rule_id}",
-                "Content-Type": "application/json",
-            }
-            payload = {
-                "recipient_user_id": task.recipient_user_id,
-                "message": task.message,
-                "comment_id": task.comment_id,
-            }
+    async def _mark_requeue(self, task_id: int, delay_s: float, error: str):
+        async with AsyncSessionLocal() as db:
+            t = await db.get(DMTask, task_id)
+            if t:
+                t.status = "queued"
+                t.next_run_at = datetime.datetime.utcnow() + datetime.timedelta(seconds=delay_s)
+                t.last_error = error
+                t.updated_at = datetime.datetime.utcnow()
+                await db.commit()
 
-            try:
-                response = await self.http_client.post(url, json=payload, headers=headers)
-                sc = response.status_code
-
-                if sc in (200, 202):
-                    dm_id = response.json().get("dm_id")
-                    task.dm_id = dm_id
-                    task.status = "sent"
-                    task.updated_at = datetime.datetime.utcnow()
-                    await self._inc(db, sent=1)
-                    await db.commit()
-                    logger.info(f"Task {task.id} sent → dm_id={dm_id}")
-
-                elif sc == 429:
-                    retry_after = float(response.headers.get("Retry-After", "10"))
-                    await rate_limiter.update_backoff(retry_after)
-                    task.status = "queued"
-                    task.next_run_at = datetime.datetime.utcnow() + datetime.timedelta(seconds=retry_after)
-                    task.last_error = f"429 Retry-After={retry_after}s"
-                    task.updated_at = datetime.datetime.utcnow()
-                    await db.commit()
-                    logger.warning(f"Task {task.id} rate-limited, retry in {retry_after}s")
-
-                elif sc >= 500:
-                    task.attempts += 1
-                    task.last_error = f"HTTP {sc}: {response.text[:200]}"
-                    task.updated_at = datetime.datetime.utcnow()
-                    if task.attempts >= settings.MAX_RETRY_ATTEMPTS:
-                        task.status = "failed"
-                        await self._inc(db, failed=1)
-                        logger.error(f"Task {task.id} permanently failed after {task.attempts} attempts")
-                    else:
-                        task.status = "queued"
-                        task.next_run_at = datetime.datetime.utcnow() + datetime.timedelta(seconds=2 ** task.attempts)
-                        logger.warning(f"Task {task.id} server error {sc}, retrying")
-                    await db.commit()
-
+    async def _mark_retry_or_fail(self, task_id: int, prev_attempts: int, error: str):
+        async with AsyncSessionLocal() as db:
+            t = await db.get(DMTask, task_id)
+            if t:
+                t.attempts = prev_attempts + 1
+                t.last_error = error
+                t.updated_at = datetime.datetime.utcnow()
+                if t.attempts >= settings.MAX_RETRY_ATTEMPTS:
+                    t.status = "failed"
+                    await db.execute(
+                        update(StatCounter).where(StatCounter.id == 1).values(
+                            failed=StatCounter.failed + 1
+                        )
+                    )
                 else:
-                    task.status = "failed"
-                    task.last_error = f"HTTP {sc}: {response.text[:200]}"
-                    task.updated_at = datetime.datetime.utcnow()
-                    await self._inc(db, failed=1)
-                    await db.commit()
-                    logger.error(f"Task {task.id} non-retryable {sc}")
+                    t.status = "queued"
+                    t.next_run_at = datetime.datetime.utcnow() + datetime.timedelta(
+                        seconds=2 ** t.attempts
+                    )
+                await db.commit()
 
-            except Exception as exc:
-                await db.rollback()
-                logger.error(f"Network error task {task_id}: {exc}")
-                try:
-                    async with AsyncSessionLocal() as rdb:
-                        t = await rdb.get(DMTask, task_id)
-                        if t and t.status == "processing":
-                            t.attempts += 1
-                            t.last_error = str(exc)[:250]
-                            t.updated_at = datetime.datetime.utcnow()
-                            if t.attempts >= settings.MAX_RETRY_ATTEMPTS:
-                                t.status = "failed"
-                                await self._inc(rdb, failed=1)
-                            else:
-                                t.status = "queued"
-                                t.next_run_at = datetime.datetime.utcnow() + datetime.timedelta(seconds=2 ** t.attempts)
-                            await rdb.commit()
-                except Exception as inner:
-                    logger.error(f"Recovery failed for task {task_id}: {inner}")
-
-    # ── Atomic stat increment (safe under concurrent writers) ─────────────────
-
-    async def _inc(self, db, sent: int = 0, failed: int = 0):
-        """
-        PostgreSQL atomic UPDATE: concurrent writers on the same row are
-        serialised by the DB engine at the row level — no lost-update possible.
-        """
-        await db.execute(
-            update(StatCounter).where(StatCounter.id == 1).values(
-                sent=StatCounter.sent + sent,
-                failed=StatCounter.failed + failed,
-            )
-        )
+    async def _mark_failed(self, task_id: int, error: str):
+        async with AsyncSessionLocal() as db:
+            t = await db.get(DMTask, task_id)
+            if t:
+                t.status = "failed"
+                t.last_error = error
+                t.updated_at = datetime.datetime.utcnow()
+                await db.execute(
+                    update(StatCounter).where(StatCounter.id == 1).values(
+                        failed=StatCounter.failed + 1
+                    )
+                )
+                await db.commit()
 
 
 dm_worker = DMWorker()
