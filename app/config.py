@@ -2,8 +2,8 @@ import os
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
-    # Mock API credentials
-    API_KEY: str = "YOUR_API_KEY_HERE"
+    # Mock API credentials (read strictly from environment variable API_KEY)
+    API_KEY: str = ""
     PSEUDOGRAM_BASE_URL: str = "https://pseudogram-api.onrender.com"
 
     # Profile & Submission info
