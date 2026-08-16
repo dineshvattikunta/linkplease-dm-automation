@@ -1,51 +1,54 @@
 import asyncio
 import time
-from collections import deque
 from app.config import settings
 
-class SlidingWindowRateLimiter:
+
+class TokenBucketRateLimiter:
     """
-    Sliding window rate limiter that strictly guarantees max_requests 
-    per window_seconds across all async tasks.
+    Token bucket rate limiter that enforces a fixed minimum interval between
+    requests (= window_seconds / max_requests). Unlike a sliding window, this
+    eliminates burst-then-idle behaviour and produces a smooth, steady throughput
+    at exactly max_requests per window_seconds — safe under Pseudogram's rolling
+    10-req/60s cap.
     """
+
     def __init__(self, max_requests: int = None, window_seconds: float = None):
-        self.max_requests = max_requests or settings.RATE_LIMIT_MAX_REQUESTS
-        self.window_seconds = window_seconds or float(settings.RATE_LIMIT_WINDOW_SECONDS)
-        self.timestamps = deque()
-        self.lock = asyncio.Lock()
-        self.forced_backoff_until = 0.0
+        max_requests = max_requests or settings.RATE_LIMIT_MAX_REQUESTS
+        window_seconds = window_seconds or float(settings.RATE_LIMIT_WINDOW_SECONDS)
+        # Minimum seconds between successive requests
+        self.interval = window_seconds / max_requests
+        self._next_allowed = 0.0
+        self._lock = asyncio.Lock()
+
+        # Forced-backoff support (for 429 Retry-After)
+        self._forced_backoff_until = 0.0
 
     async def acquire(self):
-        """
-        Blocks asynchronously until a request slot is available in the rolling window.
-        """
-        while True:
-            async with self.lock:
-                now = time.time()
+        """Block until the next request slot is available."""
+        async with self._lock:
+            now = time.monotonic()
 
-                # If server returned 429 with Retry-After, respect forced backoff
-                if now < self.forced_backoff_until:
-                    wait_time = self.forced_backoff_until - now + 0.1
+            # Respect any forced backoff from a 429 response
+            if now < self._forced_backoff_until:
+                wait = self._forced_backoff_until - now
+                self._next_allowed = self._forced_backoff_until + self.interval
+            else:
+                if now >= self._next_allowed:
+                    wait = 0.0
+                    self._next_allowed = now + self.interval
                 else:
-                    # Remove timestamps outside rolling window
-                    while self.timestamps and self.timestamps[0] <= now - self.window_seconds:
-                        self.timestamps.popleft()
+                    wait = self._next_allowed - now
+                    self._next_allowed += self.interval
 
-                    if len(self.timestamps) < self.max_requests:
-                        self.timestamps.append(now)
-                        return
-                    else:
-                        # Time until the oldest timestamp falls outside the rolling window
-                        oldest = self.timestamps[0]
-                        wait_time = (oldest + self.window_seconds) - now + 0.05
-
-            await asyncio.sleep(max(wait_time, 0.05))
+        if wait > 0:
+            await asyncio.sleep(wait)
 
     async def update_backoff(self, retry_after_seconds: float):
-        """
-        Called when mock API returns 429 Rate Limited with a Retry-After header.
-        """
-        async with self.lock:
-            self.forced_backoff_until = max(self.forced_backoff_until, time.time() + retry_after_seconds)
+        """Called when the mock API returns 429 with a Retry-After header."""
+        async with self._lock:
+            deadline = time.monotonic() + retry_after_seconds
+            if deadline > self._forced_backoff_until:
+                self._forced_backoff_until = deadline
 
-rate_limiter = SlidingWindowRateLimiter()
+
+rate_limiter = TokenBucketRateLimiter()
