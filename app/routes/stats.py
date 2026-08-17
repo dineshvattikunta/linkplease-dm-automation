@@ -49,3 +49,41 @@ async def reset_database(db: AsyncSession = Depends(get_db)):
     await db.commit()
     return {"status": "ok", "message": "Database and stats reset clean"}
 
+
+@router.get("/debug/dispatches", status_code=status.HTTP_200_OK)
+async def debug_dispatches(db: AsyncSession = Depends(get_db)):
+    """Temporary: returns dispatched user_ids + all webhook events for gap analysis."""
+    import json as _json
+    from app.models import WebhookEvent
+
+    dispatch_result = await db.execute(
+        select(UserRuleDispatch.user_id, UserRuleDispatch.rule_id, UserRuleDispatch.comment_id)
+    )
+    dispatched_users = [r[0] for r in dispatch_result.fetchall()]
+
+    evt_result = await db.execute(
+        select(WebhookEvent.event_id, WebhookEvent.event_type, WebhookEvent.user_id, WebhookEvent.payload)
+        .order_by(WebhookEvent.received_at)
+        .limit(600)
+    )
+    events = []
+    for row in evt_result.fetchall():
+        try:
+            p = _json.loads(row[3]) if isinstance(row[3], str) else row[3]
+            data = p.get("data", p)
+            text = data.get("text", "")
+        except Exception:
+            text = ""
+        events.append({
+            "event_id": row[0],
+            "event_type": row[1],
+            "user_id": row[2],
+            "text": text,
+        })
+
+    return {
+        "dispatched_user_ids": dispatched_users,
+        "dispatch_count": len(dispatched_users),
+        "events": events,
+        "event_count": len(events),
+    }

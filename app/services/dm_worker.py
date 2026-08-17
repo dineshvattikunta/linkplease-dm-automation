@@ -71,7 +71,7 @@ class DMWorker:
             try:
                 task_snapshot = await self._claim_one_task()
                 if task_snapshot is not None:
-                    await self._process_task(task_snapshot)
+                    await self._process_task(task_snapshot, worker_id)
                 else:
                     await asyncio.sleep(0.5)
             except asyncio.CancelledError:
@@ -119,11 +119,17 @@ class DMWorker:
 
     # ── Phase 2 + 3: Send DM, then write result  (no DB held during HTTP) ────
 
-    async def _process_task(self, snap: dict):
+    async def _process_task(self, snap: dict, worker_id: int = 0):
+        import time as _time
         task_id = snap["id"]
 
         # Block until rate-limit slot granted (shared across all workers).
+        t0 = _time.monotonic()
         await rate_limiter.acquire()
+        t1 = _time.monotonic()
+        logger.info(
+            f"[W{worker_id}] task={task_id} token_acquired wait={t1-t0:.2f}s"
+        )
 
         url = f"{settings.PSEUDOGRAM_BASE_URL}/v1/dm/send"
         headers = {
@@ -138,9 +144,12 @@ class DMWorker:
         }
 
         # ── HTTP call — NO database connection is held here ──────────────────
+        logger.info(f"[W{worker_id}] task={task_id} http_start")
         try:
             response = await self.http_client.post(url, json=payload, headers=headers)
+            t2 = _time.monotonic()
             sc = response.status_code
+            logger.info(f"[W{worker_id}] task={task_id} http_done sc={sc} duration={t2-t1:.2f}s")
         except Exception as exc:
             logger.error(f"Network error task {task_id}: {exc}")
             await self._mark_retry_or_fail(task_id, snap["attempts"], str(exc)[:250])
