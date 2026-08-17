@@ -1,0 +1,27 @@
+name: Keep Render Alive
+
+# Pings /health every 5 minutes so the free-tier service never cold-sleeps.
+# Render free tier spins down after 15 min of inactivity — this prevents that.
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # every 5 minutes, 24/7
+  workflow_dispatch:         # manual trigger for testing
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    steps:
+      - name: Ping /health
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            --max-time 30 \
+            https://linkplease-dm-automation-ol6m.onrender.com/health)
+          echo "HTTP status: $STATUS"
+          if [ "$STATUS" != "200" ]; then
+            echo "WARNING: /health returned $STATUS (service may be cold-starting)"
+            exit 0   # Don't fail the workflow — cold starts are expected occasionally
+          fi
+          echo "Service is alive and healthy."
